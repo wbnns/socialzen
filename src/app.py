@@ -9,6 +9,10 @@ import base64
 import re
 import random
 import json
+import sqlite3
+import time
+import threading
+import signal
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -59,7 +63,7 @@ try:
 except ValueError as e:
     logger.error(str(e))
     raise
-
+    
 # Initialize Twitter clients
 try:
     # Twitter v2 client for tweets
@@ -93,19 +97,21 @@ class BlueskyClient:
         self.password = password
         self.session = None
         
-    async def create_session(self):
+    async def create_session(self, force: bool = False):
         """Create or refresh Bluesky session"""
         try:
-            resp = requests.post(
-                "https://bsky.social/xrpc/com.atproto.server.createSession",
-                json={"identifier": self.handle, "password": self.password},
-            )
-            if resp.status_code == 401:
-                logger.error("Bluesky authentication failed. Please ensure you're using an App Password from Settings → App passwords")
-                raise Exception("Invalid Bluesky credentials - make sure to use an App Password")
-            resp.raise_for_status()
-            self.session = resp.json()
-            logger.info("Bluesky session created successfully")
+            # Create new session if none exists or force refresh
+            if self.session is None or force:
+                resp = requests.post(
+                    "https://bsky.social/xrpc/com.atproto.server.createSession",
+                    json={"identifier": self.handle, "password": self.password},
+                )
+                if resp.status_code == 401:
+                    logger.error("Bluesky authentication failed. Please ensure you're using an App Password from Settings → App passwords")
+                    raise Exception("Invalid Bluesky credentials - make sure to use an App Password")
+                resp.raise_for_status()
+                self.session = resp.json()
+                logger.info("Bluesky session created successfully")
         except requests.exceptions.RequestException as e:
             logger.error(f"Error creating Bluesky session: {str(e)}")
             raise
@@ -113,29 +119,67 @@ class BlueskyClient:
             logger.error(f"Unexpected error in create_session: {str(e)}")
             raise
 
+    async def handle_request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Handle request with token refresh logic"""
+        try:
+            resp = requests.request(method, url, **kwargs)
+            
+            if resp.status_code == 400:
+                error_json = resp.json()
+                if error_json.get("error") == "ExpiredToken":
+                    logger.info("Token expired, refreshing session and retrying")
+                    await self.create_session(force=True)
+                    # Update Authorization header with new token
+                    if "headers" in kwargs:
+                        kwargs["headers"]["Authorization"] = f"Bearer {self.session['accessJwt']}"
+                    # Retry with new token
+                    resp = requests.request(method, url, **kwargs)
+            
+            resp.raise_for_status()
+            return resp
+            
+        except Exception as e:
+            logger.error(f"Request failed: {str(e)}")
+            raise
+
     async def upload_image(self, image_data: BytesIO) -> Dict:
         """Upload image to Bluesky and return blob object"""
         try:
             if not self.session:
                 await self.create_session()
-                
+
+            # Always reset position to start
             image_data.seek(0)
             img_bytes = image_data.read()
             
             # Check size limit (1MB)
             if len(img_bytes) > 1000000:
                 raise Exception("Image file size too large. 1MB maximum.")
-                
-            resp = requests.post(
+
+            # Try to auto-detect content type
+            header = img_bytes[:12]
+            content_type = 'image/jpeg'  # default
+            if header.startswith(b'\xFF\xD8\xFF'):
+                content_type = 'image/jpeg'
+            elif header.startswith(b'\x89PNG\r\n\x1a\n'):
+                content_type = 'image/png'
+            elif header[:6] in (b'GIF87a', b'GIF89a'):
+                content_type = 'image/gif'
+
+            logger.info(f"Uploading image with content type: {content_type}")
+            
+            resp = await self.handle_request(
+                "POST",
                 "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
                 headers={
-                    "Content-Type": "image/jpeg",
+                    "Content-Type": content_type,
                     "Authorization": f"Bearer {self.session['accessJwt']}",
                 },
                 data=img_bytes,
             )
-            resp.raise_for_status()
+            
             return resp.json()["blob"]
+            
         except Exception as e:
             logger.error(f"Error uploading image to Bluesky: {str(e)}")
             raise
@@ -194,21 +238,27 @@ class BlueskyClient:
             facets = self.parse_links(formatted_text)
             if facets:
                 post["facets"] = facets
-                logger.info(f"Added {len(facets)} link facets to post")
 
             # Add image if provided
             if image_data:
-                blob = await self.upload_image(image_data)
-                post["embed"] = {
-                    "$type": "app.bsky.embed.images",
-                    "images": [{
-                        "alt": "Attached image",
-                        "image": blob,
-                    }],
-                }
+                logger.info("Attempting to upload image")
+                try:
+                    blob = await self.upload_image(image_data)
+                    logger.info("Image upload successful")
+                    post["embed"] = {
+                        "$type": "app.bsky.embed.images",
+                        "images": [{
+                            "alt": "Attached image",
+                            "image": blob,
+                        }],
+                    }
+                except Exception as e:
+                    logger.error(f"Failed to upload image: {str(e)}")
+                    raise
 
             # Create the post
-            resp = requests.post(
+            resp = await self.handle_request(
+                "POST",
                 "https://bsky.social/xrpc/com.atproto.repo.createRecord",
                 headers={"Authorization": f"Bearer {self.session['accessJwt']}"},
                 json={
@@ -217,7 +267,7 @@ class BlueskyClient:
                     "record": post,
                 },
             )
-            resp.raise_for_status()
+            
             return resp.json()["uri"]
 
         except Exception as e:
@@ -414,8 +464,12 @@ async def post_to_social(text: str, image_data: Optional[BytesIO] = None) -> tup
             async def post_to_bluesky():
                 logger.info("Preparing Bluesky post")
                 if image_data:
+                    # Create a new BytesIO object to avoid exhausted buffer
                     image_data.seek(0)
-                return await bluesky_client.create_post(bluesky_text, image_data)
+                    image_copy = BytesIO(image_data.read())
+                    return await bluesky_client.create_post(bluesky_text, image_copy)
+                else:
+                    return await bluesky_client.create_post(bluesky_text, None)
 
             bluesky_uri = await post_with_retry(post_to_bluesky)
             logger.info(f"Successfully posted to Bluesky: {bluesky_uri}")
@@ -461,34 +515,147 @@ async def post_to_social(text: str, image_data: Optional[BytesIO] = None) -> tup
         if temp_file:
             clean_temp_file(temp_file)
 
-async def wait_and_post(user_id: str, context: ContextTypes.DEFAULT_TYPE):
-    """Wait for potential image and post content"""
-    try:
-        await asyncio.sleep(36)
-        if user_id in pending_posts and not pending_posts[user_id].get('image_data'):
-            post_data = pending_posts[user_id]
-            logger.info(f"Processing text-only post for user {user_id}")
-            tweet_url, bluesky_uri, farcaster_status, status_msg = await post_to_social(post_data['text'])
-            
-            chat_id = post_data.get('chat_id')
-            if chat_id:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=status_msg
-                )
-            
-    except Exception as e:
-        logger.error(f"Error in wait_and_post: {str(e)}", exc_info=True)
-        chat_id = pending_posts[user_id].get('chat_id') if user_id in pending_posts else None
-        if chat_id:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Failed posting to social platforms"
-            )
-    finally:
-        if user_id in pending_posts:
-            del pending_posts[user_id]
+def init_db():
+    """Initialize SQLite database for note queue"""
+    conn = sqlite3.connect('notes.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS note_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            image_data BLOB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            posted BOOLEAN DEFAULT FALSE
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info("Note queue database initialized")
 
+def add_to_queue(text: str, image_data: Optional[BytesIO] = None):
+    """Add a new note to the queue"""
+    conn = sqlite3.connect('notes.db')
+    c = conn.cursor()
+    
+    image_bytes = None
+    if image_data:
+        image_data.seek(0)
+        image_bytes = image_data.read()
+    
+    c.execute(
+        'INSERT INTO note_queue (text, image_data) VALUES (?, ?)',
+        (text, image_bytes)
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Added new post to queue")
+
+class QueueProcessor:
+    def __init__(self):
+        self.should_stop = False
+        self.task = None
+    
+    async def process_queue(self):
+        """Process the queue every minute"""
+        while not self.should_stop:
+            try:
+                conn = sqlite3.connect('notes.db')
+                c = conn.cursor()
+                
+                # Get oldest unposted note
+                c.execute('''
+                    SELECT id, text, image_data 
+                    FROM note_queue 
+                    WHERE posted = FALSE 
+                    ORDER BY created_at ASC 
+                    LIMIT 1
+                ''')
+                
+                note = c.fetchone()
+                
+                if note:
+                    note_id, text, image_bytes = note
+                    image_data = BytesIO(image_bytes) if image_bytes else None
+                    
+                    try:
+                        # Post to social media
+                        tweet_url, bluesky_uri, farcaster_status, status_msg = await post_to_social(text, image_data)
+                        
+                        # Mark as posted
+                        c.execute('UPDATE note_queue SET posted = TRUE WHERE id = ?', (note_id,))
+                        conn.commit()
+                        logger.info(f"Successfully processed post {note_id}: {status_msg}")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to process post {note_id}: {str(e)}")
+                
+                conn.close()
+                
+            except Exception as e:
+                logger.error(f"Error in queue processor: {str(e)}")
+            
+            # Wait for 120 minutes before next check
+            try:
+                await asyncio.sleep(120 * 60)
+            except asyncio.CancelledError:
+                break
+    
+    async def start(self):
+        """Start the queue processor"""
+        self.task = asyncio.create_task(self.process_queue())
+    
+    async def stop(self):
+        """Stop the queue processor"""
+        if self.task:
+            self.should_stop = True
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+# Create a global queue processor instance
+queue_processor = QueueProcessor()
+
+def start_queue_processor():
+    """Initialize database and start queue processor"""
+    init_db()
+    
+    # Get the current event loop
+    loop = asyncio.get_event_loop()
+    
+    # Start the queue processor
+    loop.create_task(queue_processor.start())
+    logger.info("Queue processor started")
+
+async def shutdown(signal, loop):
+    """Cleanup tasks tied to the service's shutdown."""
+    logger.info(f"Received exit signal {signal.name}...")
+    
+    # First stop the queue processor
+    logger.info("Stopping queue processor...")
+    await queue_processor.stop()
+    
+    # Get all remaining tasks
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+    
+    # Cancel all tasks
+    for task in tasks:
+        task.cancel()
+    
+    # Wait for all tasks to complete with a timeout
+    try:
+        await asyncio.wait(tasks, timeout=5.0)
+        logger.info("All tasks completed successfully")
+    except asyncio.TimeoutError:
+        logger.warning("Timeout waiting for tasks to complete")
+    
+    # Stop the event loop
+    loop.stop()
+    logger.info("Shutdown complete")
+
+# Modify handle_message to use queue
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming text messages"""
     user_id = str(update.effective_user.id)
@@ -499,39 +666,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if urls:
         logger.info(f"Found URLs in message from user {user_id}: {urls}")
     
-    # Cancel existing wait task if any
-    if user_id in pending_posts and pending_posts[user_id].get('task'):
-        logger.info(f"Cancelling existing wait task for user {user_id}")
-        pending_posts[user_id]['task'].cancel()
-    
-    # Create new wait task
-    task = asyncio.create_task(wait_and_post(user_id, context))
-    
-    # Store text, task, and chat_id
-    pending_posts[user_id] = {
-        'text': text,
-        'timestamp': datetime.now(),
-        'task': task,
-        'chat_id': update.effective_chat.id
-    }
-    
-    logger.info(f"Received text from user {user_id}, waiting for potential image")
+    # Add to queue instead of waiting for image
+    add_to_queue(text)
+    await update.message.reply_text("Post added to queue")
+    logger.info(f"Added text from user {user_id} to queue")
 
+# Modify handle_photo to make caption optional
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming photos"""
     user_id = str(update.effective_user.id)
     
-    if user_id not in pending_posts:
-        await update.message.reply_text("Please send text first.")
-        return
-    
-    # Store the text before any cleanup
-    text = pending_posts[user_id]['text']
+    # Get caption if it exists, otherwise use empty string
+    text = update.message.caption or ""
     logger.info(f"Processing photo from user {user_id}")
-    
-    # Cancel the wait task
-    if pending_posts[user_id].get('task'):
-        pending_posts[user_id]['task'].cancel()
     
     try:
         # Get the highest resolution photo
@@ -543,20 +690,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_data = BytesIO()
         await file.download_to_memory(image_data)
         
-        # Post content with image
-        tweet_url, bluesky_uri, farcaster_status, status_msg = await post_to_social(text, image_data)
-        await update.message.reply_text(status_msg)
+        # Add to queue
+        add_to_queue(text, image_data)
+        await update.message.reply_text("Image added to queue" if not text else "Image and caption added to queue")
         
     except Exception as e:
         logger.error(f"Error handling photo: {str(e)}", exc_info=True)
-        await update.message.reply_text("Failed posting to social platforms")
-    finally:
-        if user_id in pending_posts:
-            del pending_posts[user_id]
+        await update.message.reply_text("Failed to add to queue")
 
 def main():
     """Main function to run the bot"""
     try:
+        # Get the event loop
+        loop = asyncio.get_event_loop()
+        
+        # Add signal handlers
+        signals = (signal.SIGTERM, signal.SIGINT)
+        for s in signals:
+            loop.add_signal_handler(
+                s, lambda s=s: asyncio.create_task(shutdown(s, loop))
+            )
+        
+        # Start queue processor before initializing bot
+        start_queue_processor()
+        
         # Initialize bot
         application = Application.builder().token(TELEGRAM_TOKEN).build()
         
@@ -566,8 +723,8 @@ def main():
         
         logger.info("Bot started successfully")
         
-        # Start polling
-        application.run_polling()
+        # Start polling with proper shutdown handling
+        application.run_polling(close_loop=False)  # Add this parameter
         
     except Exception as e:
         logger.error(f"Error starting bot: {str(e)}")
@@ -575,3 +732,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
