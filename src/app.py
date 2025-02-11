@@ -628,6 +628,47 @@ def start_queue_processor():
     loop.create_task(queue_processor.start())
     logger.info("Queue processor started")
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming text messages"""
+    user_id = str(update.effective_user.id)
+    text = update.message.text
+    
+    # Extract URLs and log them
+    _, urls = extract_and_clean_text(text)
+    if urls:
+        logger.info(f"Found URLs in message from user {user_id}: {urls}")
+    
+    # Add to queue instead of waiting for image
+    add_to_queue(text)
+    await update.message.reply_text("Post added to queue")
+    logger.info(f"Added text from user {user_id} to queue")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming photos"""
+    user_id = str(update.effective_user.id)
+    
+    # Get caption if it exists, otherwise use empty string
+    text = update.message.caption or ""
+    logger.info(f"Processing photo from user {user_id}")
+    
+    try:
+        # Get the highest resolution photo
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        logger.info(f"Downloading photo from Telegram: {photo.file_id}")
+        
+        # Download photo directly to BytesIO
+        image_data = BytesIO()
+        await file.download_to_memory(image_data)
+        
+        # Add to queue
+        add_to_queue(text, image_data)
+        await update.message.reply_text("Image added to queue" if not text else "Image and caption added to queue")
+        
+    except Exception as e:
+        logger.error(f"Error handling photo: {str(e)}", exc_info=True)
+        await update.message.reply_text("Failed to add to queue")
+
 async def shutdown(signal, loop):
     """Cleanup tasks tied to the service's shutdown."""
     logger.info(f"Received exit signal {signal.name}...")
@@ -655,49 +696,6 @@ async def shutdown(signal, loop):
     loop.stop()
     logger.info("Shutdown complete")
 
-# Modify handle_message to use queue
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming text messages"""
-    user_id = str(update.effective_user.id)
-    text = update.message.text
-    
-    # Extract URLs and log them
-    _, urls = extract_and_clean_text(text)
-    if urls:
-        logger.info(f"Found URLs in message from user {user_id}: {urls}")
-    
-    # Add to queue instead of waiting for image
-    add_to_queue(text)
-    await update.message.reply_text("Post added to queue")
-    logger.info(f"Added text from user {user_id} to queue")
-
-# Modify handle_photo to make caption optional
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming photos"""
-    user_id = str(update.effective_user.id)
-    
-    # Get caption if it exists, otherwise use empty string
-    text = update.message.caption or ""
-    logger.info(f"Processing photo from user {user_id}")
-    
-    try:
-        # Get the highest resolution photo
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        logger.info(f"Downloading photo from Telegram: {photo.file_id}")
-        
-        # Download photo directly to BytesIO
-        image_data = BytesIO()
-        await file.download_to_memory(image_data)
-        
-        # Add to queue
-        add_to_queue(text, image_data)
-        await update.message.reply_text("Image added to queue" if not text else "Image and caption added to queue")
-        
-    except Exception as e:
-        logger.error(f"Error handling photo: {str(e)}", exc_info=True)
-        await update.message.reply_text("Failed to add to queue")
-
 def main():
     """Main function to run the bot"""
     try:
@@ -724,7 +722,7 @@ def main():
         logger.info("Bot started successfully")
         
         # Start polling with proper shutdown handling
-        application.run_polling(close_loop=False)  # Add this parameter
+        application.run_polling(close_loop=False)
         
     except Exception as e:
         logger.error(f"Error starting bot: {str(e)}")
